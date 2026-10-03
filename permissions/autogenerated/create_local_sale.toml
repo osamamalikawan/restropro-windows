@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-local-sale"
+description = "Enables the create_local_sale command without any pre-configured scope."
+commands.allow = ["create_local_sale"]
+
+[[permission]]
+identifier = "deny-create-local-sale"
+description = "Denies the create_local_sale command without any pre-configured scope."
+commands.deny = ["create_local_sale"]

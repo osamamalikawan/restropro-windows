@@ -1,0 +1,33 @@
+fn main() {
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(&[
+                "print_raw",
+                "test_printer_connection",
+                "list_windows_printers",
+                "print_raw_windows",
+                "list_serial_ports",
+                "check_serial_port",
+                "print_raw_serial",
+                "list_usb_printers",
+                "print_raw_usb",
+                "secure_set",
+                "secure_get",
+                "secure_delete",
+                "get_device_info",
+                "get_cached_staff_list",
+                "verify_staff_pin",
+                "activate_device",
+                "get_local_session",
+                "staff_logout",
+                "sync_now",
+                "get_sync_status",
+                "get_cached_data",
+                "search_local_customers",
+                "create_local_sale",
+                "api_request",
+                "check_online",
+            ])),
+    )
+    .unwrap();
+}

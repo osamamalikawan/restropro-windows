@@ -1,0 +1,29 @@
+[package]
+name = "restropro-pos"
+version = "0.2.0"
+description = "Restro Pro POS — desktop shell with direct network thermal printer support"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nusb = "0.2"
+serialport = { version = "4", default-features = false }
+windows = { version = "0.58", features = ["Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Foundation"] }
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+sha2 = "0.10"
+zip = "2"
+dirs = "5"
+mime_guess = "2"
+bcrypt = "0.15"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[[bin]]
+name = "restropro-pos"
+path = "src/main.rs"

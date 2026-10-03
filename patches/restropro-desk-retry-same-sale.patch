@@ -1,0 +1,20 @@
+diff --git a/src/sync.rs b/src/sync.rs
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -371,8 +371,15 @@
+             if status.locked {
+                 return Err(status.lock_reason.unwrap_or_else(|| "Sync required before selling".to_string()));
+             }
++            // New sale -> queue it. Same id again: a sale still waiting ('pending') or already
++            // uploaded ('synced') is left exactly as it is; one the server REJECTED is put back in
++            // the queue with the current cart, so pressing Save/Print again after fixing the cause
++            // really retries instead of replaying the old error forever.
+             conn.execute(
+-                "INSERT OR IGNORE INTO sales_outbox (client_sale_id, payload, created_at) VALUES (?1, ?2, ?3)",
++                "INSERT INTO sales_outbox (client_sale_id, payload, created_at) VALUES (?1, ?2, ?3)
++                 ON CONFLICT(client_sale_id) DO UPDATE
++                   SET payload = excluded.payload, status = 'pending', error = NULL
++                   WHERE sales_outbox.status = 'rejected'",
+                 params![client_sale_id, sale.to_string(), Utc::now().to_rfc3339()],
+             )
+             .map_err(|e| e.to_string())?;

@@ -1,0 +1,33 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ nusb = "0.2"
+ windows = { version = "0.58", features = ["Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Foundation"] }
+-keyring = "3"
++keyring = { version = "3", features = ["windows-native", "apple-native"] }
+ reqwest = { version = "0.12", features = ["blocking", "json"] }
+ sha2 = "0.10"
+ zip = "2"
+diff --git a/src/staff_auth.rs b/src/staff_auth.rs
+--- a/src/staff_auth.rs
++++ b/src/staff_auth.rs
+@@ -44,7 +44,16 @@
+         },
+     );
+     match result {
+-        Ok(info) => Ok(Some(info)),
++        Ok(info) => {
++            // A device is only "activated" while its token is in the OS credential store. If the
++            // token is gone (credential store cleared, or an old build that never saved it), report
++            // "not activated" so the login screen offers activation again instead of leaving a
++            // device that can never sync. A credential-store *error* is not treated as missing.
++            if matches!(crate::secure_store::secure_get("device_token".to_string()), Ok(None)) {
++                return Ok(None);
++            }
++            Ok(Some(info))
++        }
+         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+         Err(e) => Err(e.to_string()),
+     }

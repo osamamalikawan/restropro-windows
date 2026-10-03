@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-print-raw-windows"
+description = "Enables the print_raw_windows command without any pre-configured scope."
+commands.allow = ["print_raw_windows"]
+
+[[permission]]
+identifier = "deny-print-raw-windows"
+description = "Denies the print_raw_windows command without any pre-configured scope."
+commands.deny = ["print_raw_windows"]

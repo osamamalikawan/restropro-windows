@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-serial-port"
+description = "Enables the check_serial_port command without any pre-configured scope."
+commands.allow = ["check_serial_port"]
+
+[[permission]]
+identifier = "deny-check-serial-port"
+description = "Denies the check_serial_port command without any pre-configured scope."
+commands.deny = ["check_serial_port"]

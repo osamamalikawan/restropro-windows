@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-print-raw-usb"
+description = "Enables the print_raw_usb command without any pre-configured scope."
+commands.allow = ["print_raw_usb"]
+
+[[permission]]
+identifier = "deny-print-raw-usb"
+description = "Denies the print_raw_usb command without any pre-configured scope."
+commands.deny = ["print_raw_usb"]

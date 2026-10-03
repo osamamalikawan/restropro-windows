@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-test-printer-connection"
+description = "Enables the test_printer_connection command without any pre-configured scope."
+commands.allow = ["test_printer_connection"]
+
+[[permission]]
+identifier = "deny-test-printer-connection"
+description = "Denies the test_printer_connection command without any pre-configured scope."
+commands.deny = ["test_printer_connection"]

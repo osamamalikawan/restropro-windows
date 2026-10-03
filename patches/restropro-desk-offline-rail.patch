@@ -1,0 +1,885 @@
+diff --git a/build.rs b/build.rs
+index fa8bbea..8ac0102 100644
+--- a/build.rs
++++ b/build.rs
+@@ -23,6 +23,7 @@ fn main() {
+                 "search_local_customers",
+                 "create_local_sale",
+                 "api_request",
++                "check_online",
+             ])),
+     )
+     .unwrap();
+diff --git a/capabilities/default.json b/capabilities/default.json
+index c9e5ee1..8272cb7 100644
+--- a/capabilities/default.json
++++ b/capabilities/default.json
+@@ -29,6 +29,7 @@
+     "allow-get-cached-data",
+     "allow-search-local-customers",
+     "allow-create-local-sale",
+-    "allow-api-request"
++    "allow-api-request",
++    "allow-check-online"
+   ]
+ }
+\ No newline at end of file
+diff --git a/src/api_bridge.rs b/src/api_bridge.rs
+index 164c183..56e1923 100644
+--- a/src/api_bridge.rs
++++ b/src/api_bridge.rs
+@@ -2,17 +2,44 @@
+ //! `api_request`, which forwards it to the cloud server with this device's credentials and the
+ //! id of the cashier signed in on the device (PIN checked locally). Server-side, each request is
+ //! re-authorised from the database (employee active + role + same restaurant + device not revoked).
+-//! Offline, the call simply fails and the screen shows its normal network-error state.
++//!
++//! Offline: the screens that must keep working (Ticket Rail, Sales, Unpaid Orders) are answered
++//! from this device — see offline_api.rs. Everything else fails fast with a network error, which
++//! the app shows as the "You're offline" page, instead of hanging.
+ 
++use crate::local_db::Db;
++use crate::offline_api as offline;
+ use crate::staff_auth::SessionState;
+ use crate::sync::API_BASE;
+ use serde::Serialize;
++use serde_json::{json, Value};
++use std::sync::atomic::{AtomicI64, Ordering};
+ use std::time::Duration;
+ use tauri::{AppHandle, Manager};
+ 
+ /// Never reachable through the bridge, whatever the screen asks for.
+ const BLOCKED_PREFIXES: [&str; 4] = ["/api/device/", "/api/super-admin", "/api/cron", "/api/staff/login"];
+ 
++/// When the cloud last failed to answer (epoch ms; 0 = it is answering). Requests made within a few
++/// seconds of a failure skip the network and go straight to the offline path, so a dead connection
++/// doesn't make every screen wait for a timeout.
++static LAST_NET_FAIL: AtomicI64 = AtomicI64::new(0);
++const OFFLINE_HINT_MS: i64 = 8_000;
++
++fn now_ms() -> i64 {
++    chrono::Utc::now().timestamp_millis()
++}
++fn recently_failed() -> bool {
++    let t = LAST_NET_FAIL.load(Ordering::Relaxed);
++    t != 0 && now_ms() - t < OFFLINE_HINT_MS
++}
++fn mark_failed() {
++    LAST_NET_FAIL.store(now_ms(), Ordering::Relaxed);
++}
++fn mark_ok() {
++    LAST_NET_FAIL.store(0, Ordering::Relaxed);
++}
++
+ #[derive(Serialize)]
+ pub struct ApiReply {
+     status: u16,
+@@ -20,7 +47,11 @@ pub struct ApiReply {
+     body: String,
+ }
+ 
+-fn check_path(path: &str) -> Result<(), String> {
++fn json_reply(status: u16, v: Value) -> ApiReply {
++    ApiReply { status, content_type: Some("application/json".to_string()), body: v.to_string() }
++}
++
++pub fn check_path(path: &str) -> Result<(), String> {
+     if !path.starts_with("/api/") || path.contains("..") || path.contains('\\') || path.contains("//") {
+         return Err("Blocked request path".to_string());
+     }
+@@ -31,6 +62,176 @@ fn check_path(path: &str) -> Result<(), String> {
+     Ok(())
+ }
+ 
++enum NetError {
++    /// The cloud could not be reached (no internet, DNS, timeout).
++    Offline(String),
++    /// Something local (not activated, not signed in) — not a connectivity problem.
++    Local(String),
++}
++
++fn http(app: &AppHandle, method: &reqwest::Method, path: &str, body: Option<&str>, content_type: Option<&str>) -> Result<ApiReply, NetError> {
++    let token = crate::secure_store::secure_get("device_token".to_string())
++        .map_err(NetError::Local)?
++        .ok_or_else(|| NetError::Local("This device is not activated yet".to_string()))?;
++    let employee_id = app
++        .state::<SessionState>()
++        .0
++        .lock()
++        .map_err(|e| NetError::Local(e.to_string()))?
++        .as_ref()
++        .map(|s| s.employee_id.clone())
++        .ok_or_else(|| NetError::Local("Not signed in".to_string()))?;
++
++    let client = reqwest::blocking::Client::builder()
++        .connect_timeout(Duration::from_secs(4))
++        .timeout(Duration::from_secs(30))
++        .build()
++        .map_err(|e| NetError::Local(e.to_string()))?;
++
++    let mut req = client
++        .request(method.clone(), format!("{API_BASE}{path}"))
++        .bearer_auth(token)
++        .header("x-staff-id", employee_id);
++    if let Some(b) = body {
++        req = req.header("content-type", content_type.unwrap_or("application/json")).body(b.to_string());
++    }
++
++    let resp = req.send().map_err(|e| NetError::Offline(format!("Could not reach the server — {e}")))?;
++    let status = resp.status().as_u16();
++    let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
++    let body = resp.text().map_err(|e| NetError::Offline(format!("Could not read the server response — {e}")))?;
++    Ok(ApiReply { status, content_type, body })
++}
++
++/// Try the cloud (unless it just failed). Ok = it answered (any HTTP status).
++fn try_http(app: &AppHandle, method: &reqwest::Method, path: &str, body: Option<&str>, content_type: Option<&str>) -> Result<ApiReply, NetError> {
++    if recently_failed() {
++        return Err(NetError::Offline("You're offline — this needs an internet connection".to_string()));
++    }
++    match http(app, method, path, body, content_type) {
++        Ok(r) => {
++            mark_ok();
++            Ok(r)
++        }
++        Err(NetError::Offline(e)) => {
++            mark_failed();
++            Err(NetError::Offline(e))
++        }
++        Err(e) => Err(e),
++    }
++}
++
++fn net_msg(e: NetError) -> String {
++    match e {
++        NetError::Offline(m) | NetError::Local(m) => m,
++    }
++}
++
++/// A body that names a sale rung up on this device ("local:<id>") is rewritten to the server's id
++/// once that sale has uploaded; before that, the server can't act on it.
++fn remap_local_sale(db: &Db, body: &str) -> Result<String, ApiReply> {
++    let Ok(mut v) = serde_json::from_str::<Value>(body) else { return Ok(body.to_string()) };
++    let Some(sale_id) = v["saleId"].as_str().filter(|s| s.starts_with("local:")).map(str::to_string) else {
++        return Ok(body.to_string());
++    };
++    let conn = db.0.lock().map_err(|e| json_reply(500, json!({ "error": e.to_string() })))?;
++    match offline::server_id_for_local(&conn, &sale_id) {
++        Some(server_id) => {
++            v["saleId"] = json!(server_id);
++            Ok(v.to_string())
++        }
++        None => Err(json_reply(
++            409,
++            json!({ "error": "This order was rung up on this device and hasn't synced yet. Try again once the device is online and has synced." }),
++        )),
++    }
++}
++
++fn kitchen_status(app: &AppHandle, db: &Db, path: &str, body: Option<String>, content_type: Option<String>) -> Result<ApiReply, String> {
++    let raw = body.unwrap_or_default();
++    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
++    let (Some(sale_ref), Some(status)) = (v["saleId"].as_str().map(str::to_string), v["kitchenStatus"].as_str().map(str::to_string)) else {
++        return Ok(json_reply(400, json!({ "error": "saleId and a valid kitchenStatus are required" })));
++    };
++    if !offline::KITCHEN_STATUSES.contains(&status.as_str()) {
++        return Ok(json_reply(400, json!({ "error": "saleId and a valid kitchenStatus are required" })));
++    }
++
++    // A sale that is still only on this device: remember the move, the sync applies it later.
++    let mut server_id = sale_ref.clone();
++    if sale_ref.starts_with("local:") {
++        let conn = db.0.lock().map_err(|e| e.to_string())?;
++        match offline::server_id_for_local(&conn, &sale_ref) {
++            Some(id) => server_id = id,
++            None => {
++                offline::record_kitchen_op(&conn, &sale_ref, &status)?;
++                return Ok(json_reply(200, json!({ "success": true, "queued": true })));
++            }
++        }
++    }
++
++    let forwarded = json!({ "saleId": server_id, "kitchenStatus": status }).to_string();
++    match try_http(app, &reqwest::Method::POST, path, Some(&forwarded), content_type.as_deref()) {
++        Ok(reply) => {
++            if reply.status == 200 {
++                if let Ok(conn) = db.0.lock() {
++                    offline::set_cache_kitchen(&conn, &server_id, &status);
++                }
++            }
++            Ok(reply)
++        }
++        Err(NetError::Offline(_)) => {
++            let conn = db.0.lock().map_err(|e| e.to_string())?;
++            offline::record_kitchen_op(&conn, &server_id, &status)?;
++            Ok(json_reply(200, json!({ "success": true, "queued": true })))
++        }
++        Err(NetError::Local(m)) => Err(m),
++    }
++}
++
++fn handle(app: AppHandle, method: reqwest::Method, path: String, body: Option<String>, content_type: Option<String>) -> Result<ApiReply, String> {
++    let db = app.state::<Db>();
++    let (base, qp) = offline::split_path(&path);
++
++    if method == reqwest::Method::POST && base == "/api/sales/kitchen-status" {
++        return kitchen_status(&app, &db, &path, body, content_type);
++    }
++
++    // Other changes to a sale made on this device (cancel, take payment, edit): map its id, or say
++    // plainly that it has to upload first.
++    let body = match body {
++        Some(b) if method != reqwest::Method::GET => match remap_local_sale(&db, &b) {
++            Ok(b) => Some(b),
++            Err(reply) => return Ok(reply),
++        },
++        other => other,
++    };
++
++    let local_get = method == reqwest::Method::GET && offline::is_local_capable_get(&path);
++    match try_http(&app, &method, &path, body.as_deref(), content_type.as_deref()) {
++        Ok(mut reply) => {
++            if local_get && reply.status == 200 && base == "/api/sales" {
++                if let Ok(conn) = db.0.lock() {
++                    if let Some(adjusted) = offline::adjust_online_sales(&conn, &reply.body, &qp) {
++                        reply.body = adjusted;
++                    }
++                }
++            }
++            Ok(reply)
++        }
++        Err(NetError::Offline(msg)) => {
++            if local_get {
++                let conn = db.0.lock().map_err(|e| e.to_string())?;
++                if let Some(v) = offline::serve_get_local(&conn, &path) {
++                    return Ok(json_reply(200, v));
++                }
++            }
++            Err(msg)
++        }
++        Err(e) => Err(net_msg(e)),
++    }
++}
++
+ #[tauri::command]
+ pub async fn api_request(
+     app: AppHandle,
+@@ -44,42 +245,32 @@ pub async fn api_request(
+     if ![reqwest::Method::GET, reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::PATCH, reqwest::Method::DELETE].contains(&method) {
+         return Err("Method not allowed".to_string());
+     }
++    tauri::async_runtime::spawn_blocking(move || handle(app, method, path, body, content_type))
++        .await
++        .map_err(|e| e.to_string())?
++}
+ 
+-    tauri::async_runtime::spawn_blocking(move || -> Result<ApiReply, String> {
+-        let token = crate::secure_store::secure_get("device_token".to_string())?
+-            .ok_or_else(|| "This device is not activated yet".to_string())?;
+-        let employee_id = app
+-            .state::<SessionState>()
+-            .0
+-            .lock()
+-            .map_err(|e| e.to_string())?
+-            .as_ref()
+-            .map(|s| s.employee_id.clone())
+-            .ok_or_else(|| "Not signed in".to_string())?;
+-
+-        let client = reqwest::blocking::Client::builder()
+-            .timeout(Duration::from_secs(30))
+-            .build()
+-            .map_err(|e| e.to_string())?;
+-
+-        let mut req = client
+-            .request(method, format!("{API_BASE}{path}"))
+-            .bearer_auth(token)
+-            .header("x-staff-id", employee_id);
+-        if let Some(b) = body {
+-            req = req.header("content-type", content_type.unwrap_or_else(|| "application/json".to_string())).body(b);
++/// Is the cloud reachable right now? A quick TCP connect (no HTTP, no login), polled by the UI to
++/// decide whether to show the "You're offline" page. Also resets/sets the fast-fail hint above.
++#[tauri::command]
++pub async fn check_online() -> bool {
++    tauri::async_runtime::spawn_blocking(|| {
++        use std::net::{TcpStream, ToSocketAddrs};
++        let host = API_BASE.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
++        let addr = if host.contains(':') { host.to_string() } else { format!("{host}:443") };
++        let ok = addr
++            .to_socket_addrs()
++            .ok()
++            .and_then(|mut it| it.next())
++            .map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(3)).is_ok())
++            .unwrap_or(false);
++        if ok {
++            mark_ok();
++        } else {
++            mark_failed();
+         }
+-
+-        let resp = req.send().map_err(|e| format!("Could not reach the server — {e}"))?;
+-        let status = resp.status().as_u16();
+-        let content_type = resp
+-            .headers()
+-            .get("content-type")
+-            .and_then(|v| v.to_str().ok())
+-            .map(|s| s.to_string());
+-        let body = resp.text().map_err(|e| format!("Could not read the server response — {e}"))?;
+-        Ok(ApiReply { status, content_type, body })
++        ok
+     })
+     .await
+-    .map_err(|e| e.to_string())?
+-}
+\ No newline at end of file
++    .unwrap_or(false)
++}
+diff --git a/src/local_db.rs b/src/local_db.rs
+index 101e03f..8d842e4 100644
+--- a/src/local_db.rs
++++ b/src/local_db.rs
+@@ -46,6 +46,16 @@ pub fn init() -> Db {
+             order_no TEXT,
+             error TEXT
+         );
++        -- Ticket Rail moves made while offline (or on a sale that has not uploaded yet). Uploaded by
++        -- the sync; sale_ref is the server sale id, or local:<clientSaleId> for a sale still on this device.
++        CREATE TABLE IF NOT EXISTS kitchen_ops (
++            op_id INTEGER PRIMARY KEY AUTOINCREMENT,
++            sale_ref TEXT NOT NULL,
++            kitchen_status TEXT NOT NULL,
++            created_at TEXT NOT NULL,
++            status TEXT NOT NULL DEFAULT 'pending',
++            error TEXT
++        );
+         CREATE TABLE IF NOT EXISTS sync_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             last_sync_at TEXT,
+@@ -57,6 +67,10 @@ pub fn init() -> Db {
+         ",
+     )
+     .expect("failed to initialize local database schema");
++    // Added after the first release: the server's id of an uploaded sale (so Ticket Rail moves made
++    // while it was only on this device can be applied to it). SQLite has no "ADD COLUMN IF NOT
++    // EXISTS", so a "duplicate column" error on later starts is expected and ignored.
++    let _ = conn.execute("ALTER TABLE sales_outbox ADD COLUMN server_sale_id TEXT", []);
+     Db(Mutex::new(conn))
+ }
+ 
+@@ -139,6 +153,10 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
+         .map_err(|e| e.to_string())?;
+     }
+ 
++    if let Some(rows) = snap["recentSales"].as_array() {
++        crate::offline_api::merge_sales_into_cache(&tx, rows)?;
++    }
++
+     tx.execute("DELETE FROM staff_cache", []).map_err(|e| e.to_string())?;
+     for row in &roster {
+         tx.execute(
+diff --git a/src/main.rs b/src/main.rs
+index ad2c96f..aad1383 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Printing::{
+ mod secure_store;
+ mod bundle_updater;
+ mod local_db;
++mod offline_api;
+ mod staff_auth;
+ mod sync;
+ mod api_bridge;
+@@ -369,7 +370,8 @@ fn main() {
+             sync::get_cached_data,
+             sync::search_local_customers,
+             sync::create_local_sale,
+-            api_bridge::api_request
++            api_bridge::api_request,
++            api_bridge::check_online
+         ])
+         .run(tauri::generate_context!())
+         .expect("error while running Restro Pro POS");
+diff --git a/src/offline_api.rs b/src/offline_api.rs
+new file mode 100644
+index 0000000..2519027
+--- /dev/null
++++ b/src/offline_api.rs
+@@ -0,0 +1,329 @@
++//! Local answers for the screens that must keep working with no internet (Ticket Rail, Sales,
++//! Unpaid Orders). The screens keep calling `fetch("/api/...")`; `api_bridge` asks the cloud
++//! first and falls back to this module when it can't be reached:
++//!
++//!  - lists of orders come from the last copy of recent sales (downloaded by the sync and kept
++//!    fresh by every successful online request) PLUS the sales rung up on this device that have
++//!    not uploaded yet (shown immediately, even while online),
++//!  - Ticket Rail moves are recorded in `kitchen_ops` and uploaded by the next sync.
++
++use chrono::{DateTime, Utc};
++use rusqlite::{params, Connection, OptionalExtension};
++use serde_json::{json, Value};
++use std::collections::HashMap;
++
++const KEEP_RECENT: usize = 400;
++const KEEP_UNPAID: usize = 300;
++pub const KITCHEN_STATUSES: [&str; 3] = ["New", "Preparing", "Completed"];
++
++// ---------------------------------------------------------------- tiny helpers
++
++pub fn percent_decode(s: &str) -> String {
++    let b = s.as_bytes();
++    let mut out: Vec<u8> = Vec::with_capacity(b.len());
++    let mut i = 0;
++    while i < b.len() {
++        match b[i] {
++            b'+' => {
++                out.push(b' ');
++                i += 1;
++            }
++            b'%' if i + 2 < b.len() => {
++                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
++                match hex {
++                    Some(v) => {
++                        out.push(v);
++                        i += 3;
++                    }
++                    None => {
++                        out.push(b'%');
++                        i += 1;
++                    }
++                }
++            }
++            c => {
++                out.push(c);
++                i += 1;
++            }
++        }
++    }
++    String::from_utf8_lossy(&out).into_owned()
++}
++
++pub fn split_path(path: &str) -> (&str, HashMap<String, String>) {
++    let (base, query) = path.split_once('?').unwrap_or((path, ""));
++    let mut map = HashMap::new();
++    for pair in query.split('&').filter(|p| !p.is_empty()) {
++        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
++        map.insert(percent_decode(k), percent_decode(v));
++    }
++    (base, map)
++}
++
++fn ts(v: &Value) -> i64 {
++    v["created_at"]
++        .as_str()
++        .and_then(|s| DateTime::parse_from_rfc3339(s).ok().or_else(|| DateTime::parse_from_rfc3339(&s.replacen(' ', "T", 1)).ok()))
++        .map(|d| d.timestamp_millis())
++        .unwrap_or(0)
++}
++
++pub fn cache_get(conn: &Connection, kind: &str) -> Option<Value> {
++    conn.query_row("SELECT json FROM cache WHERE kind = ?", [kind], |r| r.get::<_, String>(0))
++        .optional()
++        .ok()
++        .flatten()
++        .and_then(|s| serde_json::from_str(&s).ok())
++}
++
++fn cache_put(conn: &Connection, kind: &str, v: &Value) -> Result<(), String> {
++    conn.execute(
++        "INSERT INTO cache (kind, json) VALUES (?1, ?2) ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
++        params![kind, v.to_string()],
++    )
++    .map(|_| ())
++    .map_err(|e| e.to_string())
++}
++
++// ---------------------------------------------------------------- kitchen ops
++
++/// sale ref (server id, or "local:<clientSaleId>") -> most recent pending Ticket Rail status.
++fn pending_kitchen(conn: &Connection) -> HashMap<String, String> {
++    let mut map = HashMap::new();
++    if let Ok(mut stmt) = conn.prepare("SELECT sale_ref, kitchen_status FROM kitchen_ops WHERE status = 'pending' ORDER BY op_id") {
++        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
++            for row in rows.flatten() {
++                map.insert(row.0, row.1);
++            }
++        }
++    }
++    map
++}
++
++pub fn record_kitchen_op(conn: &Connection, sale_ref: &str, status: &str) -> Result<(), String> {
++    if !KITCHEN_STATUSES.contains(&status) {
++        return Err("Invalid kitchen status".to_string());
++    }
++    conn.execute(
++        "INSERT INTO kitchen_ops (sale_ref, kitchen_status, created_at) VALUES (?1, ?2, ?3)",
++        params![sale_ref, status, Utc::now().to_rfc3339()],
++    )
++    .map(|_| ())
++    .map_err(|e| e.to_string())
++}
++
++/// Reflect a confirmed move in the saved copy of the sales.
++pub fn set_cache_kitchen(conn: &Connection, sale_id: &str, status: &str) {
++    if let Some(Value::Array(mut rows)) = cache_get(conn, "sales") {
++        let mut changed = false;
++        for r in rows.iter_mut() {
++            if r["id"].as_str() == Some(sale_id) {
++                r["kitchen_status"] = json!(status);
++                changed = true;
++            }
++        }
++        if changed {
++            let _ = cache_put(conn, "sales", &Value::Array(rows));
++        }
++    }
++}
++
++// ---------------------------------------------------------------- sales copy
++
++/// Merge rows into the saved copy (by id, newest wins), keep it bounded. Used by the sync
++/// snapshot and by every successful online `GET /api/sales`.
++pub fn merge_sales_into_cache(conn: &Connection, rows: &[Value]) -> Result<(), String> {
++    let mut by_id: HashMap<String, Value> = HashMap::new();
++    if let Some(Value::Array(old)) = cache_get(conn, "sales") {
++        for r in old {
++            if let Some(id) = r["id"].as_str() {
++                by_id.insert(id.to_string(), r);
++            }
++        }
++    }
++    for r in rows {
++        if let Some(id) = r["id"].as_str() {
++            by_id.insert(id.to_string(), r.clone());
++        }
++    }
++    let mut all: Vec<Value> = by_id.into_values().collect();
++    all.sort_by(|a, b| ts(b).cmp(&ts(a)));
++    let mut kept: Vec<Value> = Vec::new();
++    let mut unpaid_extra = 0;
++    for (i, r) in all.into_iter().enumerate() {
++        if i < KEEP_RECENT {
++            kept.push(r);
++        } else if r["status"].as_str() == Some("unpaid") && unpaid_extra < KEEP_UNPAID {
++            unpaid_extra += 1;
++            kept.push(r);
++        }
++    }
++    cache_put(conn, "sales", &Value::Array(kept))
++}
++
++fn num(v: &Value) -> f64 {
++    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0)
++}
++
++/// Sales rung up on this device that the server doesn't have yet, shaped like `GET /api/sales`
++/// rows. Their id is "local:<clientSaleId>"; the order number is the provisional "L<n>".
++fn synth_pending_sales(conn: &Connection) -> Vec<Value> {
++    let tables = cache_get(conn, "tables").and_then(|v| v.as_array().cloned()).unwrap_or_default();
++    let mut out = Vec::new();
++    let Ok(mut stmt) = conn.prepare("SELECT seq, client_sale_id, payload, created_at FROM sales_outbox WHERE status = 'pending' ORDER BY seq") else {
++        return out;
++    };
++    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))) else {
++        return out;
++    };
++    for (seq, client_id, payload, created) in rows.flatten() {
++        let Ok(p) = serde_json::from_str::<Value>(&payload) else { continue };
++        let items: Vec<Value> = p["items"].as_array().cloned().unwrap_or_default();
++        let items_sum: f64 = items.iter().map(|i| num(&i["price"]) * num(&i["qty"])).sum();
++        let delivery = num(&p["deliveryCharge"]);
++        let total = if p["total"].is_null() { items_sum + delivery } else { num(&p["total"]) };
++        let payments: Vec<Value> = p["payments"].as_array().cloned().unwrap_or_default();
++        let paid: f64 = payments.iter().map(|x| num(&x["amount"])).sum();
++        let table_no = p["tableId"]
++            .as_str()
++            .and_then(|id| tables.iter().find(|t| t["id"].as_str() == Some(id)))
++            .and_then(|t| t["number"].as_str().map(str::to_string).or_else(|| Some(t["number"].to_string())));
++        let customer_name = p["customerName"].as_str().filter(|s| !s.is_empty());
++        out.push(json!({
++            "id": format!("local:{client_id}"),
++            "order_no": format!("L{seq}"),
++            "order_type": p["orderType"],
++            "subtotal": items_sum,
++            "tax": (total - items_sum - delivery).max(0.0),
++            "total": total,
++            "delivery_charge": delivery,
++            "status": if paid + 0.005 >= total { "completed" } else { "unpaid" },
++            "kitchen_status": "New",
++            "created_at": p["soldAt"].as_str().map(str::to_string).unwrap_or(created),
++            "customer_id": p["customerId"],
++            "customers": customer_name.map(|n| json!({ "name": n, "phone": p["customerPhone"].as_str().unwrap_or("") })),
++            "employees": p["cashierName"].as_str().map(|n| json!({ "name": n })),
++            "tables": table_no.map(|n| json!({ "number": n })),
++            "sale_items": items.iter().map(|i| json!({ "product_id": i["productId"], "name": i["name"], "unit_price": num(&i["price"]), "quantity": num(&i["qty"]) })).collect::<Vec<_>>(),
++            "sale_payments": payments.iter().map(|x| json!({ "method": x["method"], "amount": num(&x["amount"]) })).collect::<Vec<_>>(),
++            "pending_upload": true,
++        }));
++    }
++    out
++}
++
++fn matches_filters(row: &Value, qp: &HashMap<String, String>) -> bool {
++    if let Some(st) = qp.get("status").filter(|s| !s.is_empty()) {
++        if row["status"].as_str() != Some(st.as_str()) {
++            return false;
++        }
++    }
++    if let Some(cid) = qp.get("customerId").filter(|s| !s.is_empty()) {
++        if row["customer_id"].as_str() != Some(cid.as_str()) {
++            return false;
++        }
++    }
++    if let Some(q) = qp.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()) {
++        let order = row["order_no"].as_str().map(str::to_string).unwrap_or_else(|| row["order_no"].to_string()).to_lowercase();
++        let name = row["customers"]["name"].as_str().unwrap_or("").to_lowercase();
++        let phone = row["customers"]["phone"].as_str().unwrap_or("").to_lowercase();
++        if !(order.contains(&q) || name.contains(&q) || phone.contains(&q)) {
++            return false;
++        }
++    }
++    true
++}
++
++fn apply_overlay(rows: &mut [Value], overlay: &HashMap<String, String>) {
++    if overlay.is_empty() {
++        return;
++    }
++    for r in rows.iter_mut() {
++        if let Some(status) = r["id"].as_str().and_then(|id| overlay.get(id)) {
++            r["kitchen_status"] = json!(status);
++        }
++    }
++}
++
++fn page_params(qp: &HashMap<String, String>) -> (usize, usize) {
++    let limit = qp.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
++    let offset = qp.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
++    (limit, offset)
++}
++
++/// `GET /api/sales` answered entirely from this device.
++pub fn sales_list_local(conn: &Connection, qp: &HashMap<String, String>) -> Value {
++    let mut rows: Vec<Value> = cache_get(conn, "sales").and_then(|v| v.as_array().cloned()).unwrap_or_default();
++    let pending = synth_pending_sales(conn);
++    rows.extend(pending);
++    let mut overlay = pending_kitchen(conn);
++    // a Ticket Rail move made on a not-yet-uploaded sale is recorded against its local id
++    apply_overlay(&mut rows, &overlay);
++    overlay.clear();
++
++    let mut filtered: Vec<Value> = rows.into_iter().filter(|r| matches_filters(r, qp)).collect();
++    filtered.sort_by(|a, b| ts(b).cmp(&ts(a)));
++    let (limit, offset) = page_params(qp);
++    let total = filtered.len();
++    let page: Vec<Value> = filtered.into_iter().skip(offset).take(limit).collect();
++    json!({ "sales": page, "hasMore": total > offset + limit, "offline": true })
++}
++
++/// Adjust a successful online `GET /api/sales` body: remember the rows, show sales that are still
++/// only on this device, and apply Ticket Rail moves not uploaded yet.
++pub fn adjust_online_sales(conn: &Connection, body: &str, qp: &HashMap<String, String>) -> Option<String> {
++    let mut v: Value = serde_json::from_str(body).ok()?;
++    let rows = v["sales"].as_array()?.clone();
++    let _ = merge_sales_into_cache(conn, &rows);
++
++    let overlay = pending_kitchen(conn);
++    let mut page = rows;
++    apply_overlay(&mut page, &overlay);
++
++    let (_, offset) = page_params(qp);
++    let unfiltered = !qp.contains_key("q") && !qp.contains_key("customerId");
++    if offset == 0 && unfiltered {
++        let mut pending: Vec<Value> = synth_pending_sales(conn).into_iter().filter(|r| matches_filters(r, qp)).collect();
++        apply_overlay(&mut pending, &overlay);
++        if !pending.is_empty() {
++            pending.sort_by(|a, b| ts(b).cmp(&ts(a)));
++            pending.extend(page);
++            page = pending;
++        }
++    }
++    v["sales"] = Value::Array(page);
++    Some(v.to_string())
++}
++
++// ---------------------------------------------------------------- other cached reads
++
++/// Offline answers for the small lookups those screens also fetch (same JSON shapes as the web
++/// routes). `None` = not something we can answer locally.
++pub fn serve_get_local(conn: &Connection, path: &str) -> Option<Value> {
++    let (base, qp) = split_path(path);
++    let list = |kind: &str| cache_get(conn, kind).unwrap_or_else(|| json!([]));
++    match base {
++        "/api/sales" => Some(sales_list_local(conn, &qp)),
++        "/api/tables" => Some(json!({ "tables": list("tables") })),
++        "/api/delivery-areas" => Some(json!({ "areas": list("areas") })),
++        "/api/payment-methods" => Some(json!({ "methods": list("payment_methods") })),
++        "/api/settings" => Some(cache_get(conn, "settings").unwrap_or_else(|| json!({ "restaurant": null, "settings": {} }))),
++        _ => None,
++    }
++}
++
++pub fn is_local_capable_get(path: &str) -> bool {
++    let (base, _) = split_path(path);
++    matches!(base, "/api/sales" | "/api/tables" | "/api/delivery-areas" | "/api/payment-methods" | "/api/settings")
++}
++
++/// Server id of a sale that was rung up on this device ("local:<clientSaleId>"), once uploaded.
++pub fn server_id_for_local(conn: &Connection, local_ref: &str) -> Option<String> {
++    let client_id = local_ref.strip_prefix("local:")?;
++    conn.query_row("SELECT server_sale_id FROM sales_outbox WHERE client_sale_id = ?", [client_id], |r| r.get::<_, Option<String>>(0))
++        .optional()
++        .ok()
++        .flatten()
++        .flatten()
++        .filter(|s| !s.is_empty())
++}
+diff --git a/src/staff_auth.rs b/src/staff_auth.rs
+index a6a15df..3b37acc 100644
+--- a/src/staff_auth.rs
++++ b/src/staff_auth.rs
+@@ -20,7 +20,7 @@ pub struct StaffListEntry {
+ #[derive(Serialize, Clone)]
+ pub struct LocalSession {
+     pub employee_id: String,
+-    name: String,
++    pub name: String,
+     role: String,
+     restaurant_id: String,
+     restaurant_name: String,
+diff --git a/src/sync.rs b/src/sync.rs
+index 837dbdf..2d495b9 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -184,8 +184,8 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
+                     other => other.to_string(),
+                 };
+                 conn.execute(
+-                    "UPDATE sales_outbox SET status = 'synced', order_no = ?2, error = NULL WHERE client_sale_id = ?1",
+-                    params![id, order_no],
++                    "UPDATE sales_outbox SET status = 'synced', order_no = ?2, server_sale_id = COALESCE(?3, server_sale_id), error = NULL WHERE client_sale_id = ?1",
++                    params![id, order_no, r["saleId"].as_str()],
+                 )
+                 .map_err(|e| (e.to_string(), false))?;
+                 progressed = true;
+@@ -211,6 +211,91 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
+     }
+ }
+ 
++// ---------------------------------------------------------------- ticket rail moves
++
++/// Upload Ticket Rail moves made offline. Only the latest move of each ticket is sent (earlier
++/// ones are superseded). Moves on a sale that has not uploaded yet wait until it has. Network
++/// trouble leaves everything queued for the next sync.
++fn upload_kitchen_ops(db: &Db, client: &reqwest::blocking::Client, token: &str) -> Result<(), String> {
++    let (sendable, superseded): (Vec<(String, String, Vec<i64>)>, Vec<i64>) = {
++        let conn = db.0.lock().map_err(|e| e.to_string())?;
++        let mut stmt = conn
++            .prepare("SELECT op_id, sale_ref, kitchen_status FROM kitchen_ops WHERE status = 'pending' ORDER BY op_id")
++            .map_err(|e| e.to_string())?;
++        let rows: Vec<(i64, String, String)> = stmt
++            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
++            .map_err(|e| e.to_string())?
++            .collect::<Result<_, _>>()
++            .map_err(|e| e.to_string())?;
++
++        // server sale id -> (status, op ids of every pending move of that sale)
++        let mut order: Vec<String> = Vec::new();
++        let mut by_sale: std::collections::HashMap<String, (String, Vec<i64>)> = std::collections::HashMap::new();
++        for (op_id, sale_ref, status) in rows {
++            let sale_id = if sale_ref.starts_with("local:") {
++                match crate::offline_api::server_id_for_local(&conn, &sale_ref) {
++                    Some(id) => id,
++                    None => continue, // its sale has not uploaded yet
++                }
++            } else {
++                sale_ref
++            };
++            let entry = by_sale.entry(sale_id.clone()).or_insert_with(|| {
++                order.push(sale_id.clone());
++                (status.clone(), Vec::new())
++            });
++            entry.0 = status;
++            entry.1.push(op_id);
++        }
++        let mut sendable = Vec::new();
++        let mut superseded = Vec::new();
++        for sale_id in order {
++            if let Some((status, mut ids)) = by_sale.remove(&sale_id) {
++                let last = ids.pop().unwrap_or_default();
++                superseded.extend(ids);
++                sendable.push((sale_id, status, vec![last]));
++            }
++        }
++        (sendable, superseded)
++    };
++    if sendable.is_empty() {
++        return Ok(());
++    }
++
++    let ops: Vec<Value> = sendable
++        .iter()
++        .map(|(sale_id, status, ids)| json!({ "opId": ids[0], "saleId": sale_id, "kitchenStatus": status }))
++        .collect();
++    let resp = client
++        .post(format!("{API_BASE}/api/device/kitchen-status"))
++        .bearer_auth(token)
++        .json(&json!({ "ops": ops }))
++        .send()
++        .map_err(|e| format!("Could not reach the server — {e}"))?;
++    if !resp.status().is_success() {
++        return Err(error_from(resp).0);
++    }
++    let body: Value = resp.json().map_err(|e| format!("Unexpected response — {e}"))?;
++
++    let conn = db.0.lock().map_err(|e| e.to_string())?;
++    for id in superseded {
++        let _ = conn.execute("UPDATE kitchen_ops SET status = 'synced' WHERE op_id = ?", [id]);
++    }
++    for r in body["results"].as_array().cloned().unwrap_or_default() {
++        let Some(op_id) = r["opId"].as_i64() else { continue };
++        if r["ok"].as_bool() == Some(true) {
++            let _ = conn.execute("UPDATE kitchen_ops SET status = 'synced', error = NULL WHERE op_id = ?", [op_id]);
++            if let Some((sale_id, status, _)) = sendable.iter().find(|(_, _, ids)| ids[0] == op_id) {
++                crate::offline_api::set_cache_kitchen(&conn, sale_id, status);
++            }
++        } else {
++            let err = r["error"].as_str().unwrap_or("Rejected by the server");
++            let _ = conn.execute("UPDATE kitchen_ops SET status = 'failed', error = ?2 WHERE op_id = ?1", params![op_id, err]);
++        }
++    }
++    Ok(())
++}
++
+ // ---------------------------------------------------------------- full sync
+ 
+ fn do_sync(db: &Db, retry_rejected: bool, force_snapshot: bool) -> Result<Option<String>, (String, bool)> {
+@@ -225,6 +310,8 @@ fn do_sync(db: &Db, retry_rejected: bool, force_snapshot: bool) -> Result<Option
+ 
+     // Sales first, so the snapshot we pull next already reflects their stock changes.
+     let note = upload_pending(db, &client, &token, None)?;
++    // Ticket Rail moves; a failure here must not stop the snapshot download below.
++    let _ = upload_kitchen_ops(db, &client, &token);
+ 
+     let due = {
+         let conn = db.0.lock().map_err(|e| (e.to_string(), false))?;
+@@ -352,17 +439,18 @@ pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value,
+             return Err("Order must have at least one item".to_string());
+         }
+         // The cashier is whoever is signed in on this device — never trusted from the UI.
+-        let employee_id = app
++        let (employee_id, employee_name) = app
+             .state::<SessionState>()
+             .0
+             .lock()
+             .map_err(|e| e.to_string())?
+             .as_ref()
+-            .map(|s| s.employee_id.clone())
++            .map(|s| (s.employee_id.clone(), s.name.clone()))
+             .ok_or("Not signed in")?;
+ 
+         let mut sale = payload.clone();
+         sale["cashierEmployeeId"] = json!(employee_id);
++        sale["cashierName"] = json!(employee_name);
+         sale["soldAt"] = json!(Utc::now().to_rfc3339());
+ 
+         let seq: i64 = {

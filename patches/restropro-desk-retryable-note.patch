@@ -1,0 +1,107 @@
+diff --git a/src/sync.rs b/src/sync.rs
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -139,7 +139,10 @@
+ /// Upload pending sales in batches. Idempotent on the server (clientSaleId), so it is safe if
+ /// this runs twice at once or a response is lost. Returns Err only when the server could not be
+ /// reached or refused the device; per-sale rejections are recorded in the outbox instead.
+-fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only: Option<&str>) -> Result<(), (String, bool)> {
++fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only: Option<&str>) -> Result<Option<String>, (String, bool)> {
++    // First "try again later" reason from the server (e.g. a database problem on its side). The
++    // sale stays queued and the reason is shown in the sync bar so it is never silent.
++    let mut note: Option<String> = None;
+     loop {
+         let rows: Vec<(String, String)> = {
+             let conn = db.0.lock().map_err(|e| (e.to_string(), false))?;
+@@ -156,7 +159,7 @@
+             mapped.collect::<Result<Vec<_>, _>>().map_err(|e| (e.to_string(), false))?
+         };
+         if rows.is_empty() {
+-            return Ok(());
++            return Ok(note);
+         }
+ 
+         let sales: Vec<Value> = rows.iter().filter_map(|(_, p)| serde_json::from_str(p).ok()).collect();
+@@ -186,7 +189,12 @@
+                 )
+                 .map_err(|e| (e.to_string(), false))?;
+                 progressed = true;
+-            } else if r["retryable"].as_bool() != Some(true) {
++            } else if r["retryable"].as_bool() == Some(true) {
++                let err = r["error"].as_str().unwrap_or("The server asked to try again later");
++                conn.execute("UPDATE sales_outbox SET error = ?2 WHERE client_sale_id = ?1", params![id, err])
++                    .map_err(|e| (e.to_string(), false))?;
++                note.get_or_insert_with(|| err.to_string());
++            } else {
+                 let err = r["error"].as_str().unwrap_or("Rejected by the server");
+                 conn.execute(
+                     "UPDATE sales_outbox SET status = 'rejected', error = ?2 WHERE client_sale_id = ?1",
+@@ -198,14 +206,14 @@
+         }
+         drop(conn);
+         if !progressed || only.is_some() {
+-            return Ok(()); // only retryable results left (or a single-sale attempt): try again next sync
++            return Ok(note); // only retryable results left (or a single-sale attempt): try again next sync
+         }
+     }
+ }
+ 
+ // ---------------------------------------------------------------- full sync
+ 
+-fn do_sync(db: &Db, retry_rejected: bool, force_snapshot: bool) -> Result<(), (String, bool)> {
++fn do_sync(db: &Db, retry_rejected: bool, force_snapshot: bool) -> Result<Option<String>, (String, bool)> {
+     let token = device_token().map_err(|e| (e, false))?;
+     let client = http_client(30).map_err(|e| (e, false))?;
+ 
+@@ -216,7 +224,7 @@
+     }
+ 
+     // Sales first, so the snapshot we pull next already reflects their stock changes.
+-    upload_pending(db, &client, &token, None)?;
++    let note = upload_pending(db, &client, &token, None)?;
+ 
+     let due = {
+         let conn = db.0.lock().map_err(|e| (e.to_string(), false))?;
+@@ -231,7 +239,7 @@
+         }
+     };
+     if !force_snapshot && !due {
+-        return Ok(());
++        return Ok(note);
+     }
+ 
+     let resp = client
+@@ -243,7 +251,8 @@
+         return Err(error_from(resp));
+     }
+     let snap: Value = resp.json().map_err(|e| (format!("Unexpected response — {e}"), false))?;
+-    local_db::apply_snapshot(db, &snap).map_err(|e| (e, false))
++    local_db::apply_snapshot(db, &snap).map_err(|e| (e, false))?;
++    Ok(note)
+ }
+ 
+ /// Shared by the `sync_now` command and the background thread.
+@@ -254,12 +263,17 @@
+     let _guard = SyncGuard;
+     let db = app.state::<Db>();
+ 
+-    if let Err((msg, revoked)) = do_sync(&db, retry_rejected, force_snapshot) {
+-        set_last_error(&db, &msg, revoked);
+-        return Err(msg);
+-    }
+-    if let Ok(conn) = db.0.lock() {
+-        let _ = conn.execute("UPDATE sync_state SET last_error = NULL WHERE id = 1", []);
++    match do_sync(&db, retry_rejected, force_snapshot) {
++        Err((msg, revoked)) => {
++            set_last_error(&db, &msg, revoked);
++            return Err(msg);
++        }
++        Ok(Some(note)) => set_last_error(&db, &note, false),
++        Ok(None) => {
++            if let Ok(conn) = db.0.lock() {
++                let _ = conn.execute("UPDATE sync_state SET last_error = NULL WHERE id = 1", []);
++            }
++        }
+     }
+     let conn = db.0.lock().map_err(|e| e.to_string())?;
+     status_from(&conn)

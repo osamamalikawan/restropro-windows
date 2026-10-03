@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-verify-staff-pin"
+description = "Enables the verify_staff_pin command without any pre-configured scope."
+commands.allow = ["verify_staff_pin"]
+
+[[permission]]
+identifier = "deny-verify-staff-pin"
+description = "Denies the verify_staff_pin command without any pre-configured scope."
+commands.deny = ["verify_staff_pin"]

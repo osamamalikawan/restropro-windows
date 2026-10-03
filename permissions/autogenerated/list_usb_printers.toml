@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-usb-printers"
+description = "Enables the list_usb_printers command without any pre-configured scope."
+commands.allow = ["list_usb_printers"]
+
+[[permission]]
+identifier = "deny-list-usb-printers"
+description = "Denies the list_usb_printers command without any pre-configured scope."
+commands.deny = ["list_usb_printers"]

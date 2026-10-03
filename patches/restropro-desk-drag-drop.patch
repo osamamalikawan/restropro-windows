@@ -1,0 +1,13 @@
+diff --git a/tauri.conf.json b/tauri.conf.json
+--- a/tauri.conf.json
++++ b/tauri.conf.json
+@@ -17,7 +17,8 @@
+         "height": 820,
+         "minWidth": 1024,
+         "minHeight": 700,
+-        "visible": false
++        "visible": false,
++        "dragDropEnabled": false
+       }
+     ],
+     "security": {

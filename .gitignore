@@ -1,0 +1,10 @@
+node_modules/
+.next/
+dist/
+build/
+
+src-tauri/target/
+target/
+
+.env
+.env.local

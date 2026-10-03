@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-cached-staff-list"
+description = "Enables the get_cached_staff_list command without any pre-configured scope."
+commands.allow = ["get_cached_staff_list"]
+
+[[permission]]
+identifier = "deny-get-cached-staff-list"
+description = "Denies the get_cached_staff_list command without any pre-configured scope."
+commands.deny = ["get_cached_staff_list"]

@@ -1,0 +1,191 @@
+diff --git a/build.rs b/build.rs
+index 64565d9..fa8bbea 100644
+--- a/build.rs
++++ b/build.rs
+@@ -22,6 +22,7 @@ fn main() {
+                 "get_cached_data",
+                 "search_local_customers",
+                 "create_local_sale",
++                "api_request",
+             ])),
+     )
+     .unwrap();
+diff --git a/capabilities/default.json b/capabilities/default.json
+index 7a82eab..c9e5ee1 100644
+--- a/capabilities/default.json
++++ b/capabilities/default.json
+@@ -28,6 +28,7 @@
+     "allow-get-sync-status",
+     "allow-get-cached-data",
+     "allow-search-local-customers",
+-    "allow-create-local-sale"
++    "allow-create-local-sale",
++    "allow-api-request"
+   ]
+ }
+\ No newline at end of file
+diff --git a/src/api_bridge.rs b/src/api_bridge.rs
+new file mode 100644
+index 0000000..0ba3d73
+--- /dev/null
++++ b/src/api_bridge.rs
+@@ -0,0 +1,85 @@
++//! Lets the bundled screens keep calling `fetch("/api/...")`: the web layer hands each request to
++//! `api_request`, which forwards it to the cloud server with this device's credentials and the
++//! id of the cashier signed in on the device (PIN checked locally). Server-side, each request is
++//! re-authorised from the database (employee active + role + same restaurant + device not revoked).
++//! Offline, the call simply fails and the screen shows its normal network-error state.
++
++use crate::staff_auth::SessionState;
++use crate::sync::API_BASE;
++use serde::Serialize;
++use std::time::Duration;
++use tauri::{AppHandle, Manager};
++
++/// Never reachable through the bridge, whatever the screen asks for.
++const BLOCKED_PREFIXES: [&str; 4] = ["/api/device/", "/api/super-admin", "/api/cron", "/api/staff/login"];
++
++#[derive(Serialize)]
++pub struct ApiReply {
++    status: u16,
++    content_type: Option<String>,
++    body: String,
++}
++
++fn check_path(path: &str) -> Result<(), String> {
++    if !path.starts_with("/api/") || path.contains("..") || path.contains('\\') || path.contains("//") {
++        return Err("Blocked request path".to_string());
++    }
++    let lower = path.to_lowercase();
++    if BLOCKED_PREFIXES.iter().any(|p| lower.starts_with(p)) {
++        return Err("This request is not available from the desktop app".to_string());
++    }
++    Ok(())
++}
++
++#[tauri::command]
++pub async fn api_request(
++    app: AppHandle,
++    method: String,
++    path: String,
++    body: Option<String>,
++    content_type: Option<String>,
++) -> Result<ApiReply, String> {
++    check_path(&path)?;
++    let method = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|_| "Bad method".to_string())?;
++    if ![reqwest::Method::GET, reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::PATCH, reqwest::Method::DELETE].contains(&method) {
++        return Err("Method not allowed".to_string());
++    }
++
++    tauri::async_runtime::spawn_blocking(move || -> Result<ApiReply, String> {
++        let token = crate::secure_store::secure_get("device_token".to_string())?
++            .ok_or_else(|| "This device is not activated yet".to_string())?;
++        let employee_id = app
++            .state::<SessionState>()
++            .0
++            .lock()
++            .map_err(|e| e.to_string())?
++            .as_ref()
++            .map(|s| s.employee_id.clone())
++            .ok_or_else(|| "Not signed in".to_string())?;
++
++        let client = reqwest::blocking::Client::builder()
++            .timeout(Duration::from_secs(30))
++            .build()
++            .map_err(|e| e.to_string())?;
++
++        let mut req = client
++            .request(method, format!("{API_BASE}{path}"))
++            .bearer_auth(token)
++            .header("x-staff-id", employee_id);
++        if let Some(b) = body {
++            req = req.header("content-type", content_type.unwrap_or_else(|| "application/json".to_string())).body(b);
++        }
++
++        let resp = req.send().map_err(|e| format!("Could not reach the server — {e}"))?;
++        let status = resp.status().as_u16();
++        let content_type = resp
++            .headers()
++            .get("content-type")
++            .and_then(|v| v.to_str().ok())
++            .map(|s| s.to_string());
++        let body = resp.text().map_err(|e| format!("Could not read the server response — {e}"))?;
++        Ok(ApiReply { status, content_type, body })
++    })
++    .await
++    .map_err(|e| e.to_string())?
++}
+diff --git a/src/local_db.rs b/src/local_db.rs
+index 40395bb..101e03f 100644
+--- a/src/local_db.rs
++++ b/src/local_db.rs
+@@ -116,12 +116,16 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
+     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+     let tx = conn.transaction().map_err(|e| e.to_string())?;
+ 
+-    let kinds: [(&str, &serde_json::Value); 6] = [
++    let kinds: [(&str, &serde_json::Value); 8] = [
+         ("products", &snap["products"]),
+         ("tables", &snap["tables"]),
+         ("areas", &snap["areas"]),
+         ("payment_methods", &snap["paymentMethods"]),
+         ("customers", &snap["customers"]),
++        // role -> module -> can_view, and subscription status: lets the sidebar, page guards and
++        // top bar behave like the web app while offline.
++        ("permissions", &snap["permissionMatrix"]),
++        ("meta", &serde_json::json!({ "subStatus": snap["subStatus"] })),
+         (
+             "settings",
+             &serde_json::json!({ "restaurant": snap["restaurant"], "settings": snap["settings"] }),
+diff --git a/src/main.rs b/src/main.rs
+index 668a44b..ad2c96f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -27,6 +27,7 @@ mod bundle_updater;
+ mod local_db;
+ mod staff_auth;
+ mod sync;
++mod api_bridge;
+ 
+ use tauri::Manager;
+ 
+@@ -367,7 +368,8 @@ fn main() {
+             sync::get_sync_status,
+             sync::get_cached_data,
+             sync::search_local_customers,
+-            sync::create_local_sale
++            sync::create_local_sale,
++            api_bridge::api_request
+         ])
+         .run(tauri::generate_context!())
+         .expect("error while running Restro Pro POS");
+diff --git a/src/sync.rs b/src/sync.rs
+index b1b9127..ad88b53 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -282,10 +282,10 @@ pub fn get_sync_status(db: State<Db>) -> Result<SyncStatus, String> {
+ 
+ /// Returns the last snapshot of one data kind, in the same JSON shape the web API returns:
+ /// products -> [..], tables -> [..], areas -> [..], payment_methods -> [..],
+-/// settings -> { restaurant, settings }.
++/// settings -> { restaurant, settings }, permissions -> { role: { module: bool } }, meta -> { subStatus }.
+ #[tauri::command]
+ pub fn get_cached_data(kind: String, db: State<Db>) -> Result<Value, String> {
+-    if !["products", "tables", "areas", "payment_methods", "settings"].contains(&kind.as_str()) {
++    if !["products", "tables", "areas", "payment_methods", "settings", "permissions", "meta"].contains(&kind.as_str()) {
+         return Err(format!("Unknown data kind: {kind}"));
+     }
+     let conn = db.0.lock().map_err(|e| e.to_string())?;
+@@ -295,7 +295,11 @@ pub fn get_cached_data(kind: String, db: State<Db>) -> Result<Value, String> {
+         .map_err(|e| e.to_string())?;
+     match raw {
+         Some(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
+-        None => Ok(if kind == "settings" { json!({ "restaurant": null, "settings": {} }) } else { json!([]) }),
++        None => Ok(match kind.as_str() {
++            "settings" => json!({ "restaurant": null, "settings": {} }),
++            "permissions" | "meta" => json!({}),
++            _ => json!([]),
++        }),
+     }
+ }
+ 

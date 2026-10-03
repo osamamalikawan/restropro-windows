@@ -1,0 +1,52 @@
+diff --git a/src/offline_api.rs b/src/offline_api.rs
+index 2519027..333e578 100644
+--- a/src/offline_api.rs
++++ b/src/offline_api.rs
+@@ -327,3 +327,26 @@ pub fn server_id_for_local(conn: &Connection, local_ref: &str) -> Option<String>
+         .flatten()
+         .filter(|s| !s.is_empty())
+ }
++
++/// The cashier edited an existing customer in the checkout popup: show it in the saved customer
++/// list straight away (the server record is updated when the sale uploads).
++pub fn update_cached_customer(conn: &Connection, customer_id: &str, update: &Value) {
++    let Some(Value::Array(mut rows)) = cache_get(conn, "customers") else { return };
++    let mut changed = false;
++    for r in rows.iter_mut() {
++        if r["id"].as_str() != Some(customer_id) {
++            continue;
++        }
++        for (src, dst, allow_empty) in [("name", "name", false), ("phone", "phone", false), ("address", "address", true), ("areaId", "area_id", false)] {
++            if let Some(v) = update.get(src).filter(|v| v.is_string()) {
++                if allow_empty || v.as_str().map_or(false, |t| !t.is_empty()) {
++                    r[dst] = v.clone();
++                    changed = true;
++                }
++            }
++        }
++    }
++    if changed {
++        let _ = cache_put(conn, "customers", &Value::Array(rows));
++    }
++}
+diff --git a/src/sync.rs b/src/sync.rs
+index 2d495b9..cddf2ec 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -468,6 +468,16 @@ pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value,
+                 .map_err(|e| e.to_string())?
+         };
+ 
++        // An existing customer edited at checkout: show the new details in the saved customer list
++        // now; the server record is updated when the sale uploads.
++        if let (Some(cid), Some(update)) = (payload["customerId"].as_str(), payload.get("customerUpdate")) {
++            if update.is_object() {
++                if let Ok(conn) = db.0.lock() {
++                    crate::offline_api::update_cached_customer(&conn, cid, update);
++                }
++            }
++        }
++
+         // One quick attempt; failure just means it syncs later.
+         if let (Ok(token), Ok(client)) = (device_token(), http_client(6)) {
+             let _ = upload_pending(&db, &client, &token, Some(&client_sale_id));
