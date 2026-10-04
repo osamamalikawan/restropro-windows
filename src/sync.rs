@@ -144,17 +144,17 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
     // sale stays queued and the reason is shown in the sync bar so it is never silent.
     let mut note: Option<String> = None;
     loop {
-        let rows: Vec<(String, String)> = {
+        let rows: Vec<(String, String, i64)> = {
             let conn = db.0.lock().map_err(|e| (e.to_string(), false))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT client_sale_id, payload FROM sales_outbox
+                    "SELECT client_sale_id, payload, seq FROM sales_outbox
                      WHERE status = 'pending' AND (?1 IS NULL OR client_sale_id = ?1)
                      ORDER BY seq LIMIT ?2",
                 )
                 .map_err(|e| (e.to_string(), false))?;
             let mapped = stmt
-                .query_map(params![only, UPLOAD_BATCH], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map(params![only, UPLOAD_BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .map_err(|e| (e.to_string(), false))?;
             mapped.collect::<Result<Vec<_>, _>>().map_err(|e| (e.to_string(), false))?
         };
@@ -162,7 +162,15 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
             return Ok(note);
         }
 
-        let sales: Vec<Value> = rows.iter().filter_map(|(_, p)| serde_json::from_str(p).ok()).collect();
+        // Each sale carries this device's own counter; the server builds the D<n>-<counter> id from it.
+        let sales: Vec<Value> = rows
+            .iter()
+            .filter_map(|(_, p, seq)| {
+                let mut v: Value = serde_json::from_str(p).ok()?;
+                v["deviceSeq"] = json!(seq);
+                Some(v)
+            })
+            .collect();
         let resp = client
             .post(format!("{API_BASE}/api/device/sales"))
             .bearer_auth(token)
@@ -426,9 +434,8 @@ pub fn search_local_customers(q: String, db: State<Db>) -> Result<Value, String>
 
 // ---------------------------------------------------------------- offline sale
 
-/// Saves a sale locally (always succeeds while unlocked), then makes one quick attempt to push
-/// it. Online: returns the real order number straight away. Offline: returns a provisional
-/// number ("L<n>") and the sale waits in the outbox until the next sync.
+/// Saves a sale locally (always succeeds while unlocked). The sale is saved to the local outbox and the cashier gets this device's own order id
+/// (D<device>-<counter>, e.g. D2-0045) immediately; the upload happens in the background.
 #[tauri::command]
 pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
@@ -485,24 +492,24 @@ pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value, 
             }
         }
 
-        // One quick attempt; failure just means it syncs later.
-        if let (Ok(token), Ok(client)) = (device_token(), http_client(6)) {
-            let _ = upload_pending(&db, &client, &token, Some(&client_sale_id));
-        }
+        // Offline first: the sale is already safely stored in the outbox above, so the cashier is
+        // released right now. The upload runs in the background (and the regular sync keeps retrying
+        // it); a failure just means it waits in the queue.
+        let order_id = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            crate::local_db::display_id(&conn, seq)
+        };
 
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let (status, order_no, error): (String, Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT status, order_no, error FROM sales_outbox WHERE client_sale_id = ?",
-                [&client_sale_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .map_err(|e| e.to_string())?;
-        match status.as_str() {
-            "synced" => Ok(json!({ "orderNo": order_no, "offline": false })),
-            "rejected" => Err(error.unwrap_or_else(|| "The server rejected this sale".to_string())),
-            _ => Ok(json!({ "orderNo": format!("L{seq}"), "offline": true })),
-        }
+        let bg_app = app.clone();
+        let bg_id = client_sale_id.clone();
+        std::thread::spawn(move || {
+            let db = bg_app.state::<Db>();
+            if let (Ok(token), Ok(client)) = (device_token(), http_client(20)) {
+                let _ = upload_pending(&db, &client, &token, Some(&bg_id));
+            }
+        });
+
+        Ok(json!({ "orderNo": order_id, "offline": false }))
     })
     .await
     .map_err(|e| e.to_string())?

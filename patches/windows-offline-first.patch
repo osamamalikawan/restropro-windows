@@ -1,0 +1,156 @@
+diff --git a/src/local_db.rs b/src/local_db.rs
+index 8d842e4..fb03308 100644
+--- a/src/local_db.rs
++++ b/src/local_db.rs
+@@ -130,7 +130,7 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
+     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+     let tx = conn.transaction().map_err(|e| e.to_string())?;
+ 
+-    let kinds: [(&str, &serde_json::Value); 8] = [
++    let kinds: [(&str, &serde_json::Value); 9] = [
+         ("products", &snap["products"]),
+         ("tables", &snap["tables"]),
+         ("areas", &snap["areas"]),
+@@ -144,8 +144,14 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
+             "settings",
+             &serde_json::json!({ "restaurant": snap["restaurant"], "settings": snap["settings"] }),
+         ),
++        // This device's number on the server (1, 2, 3 ...). Used for order ids like D2-0045.
++        // Only overwritten when the server sends one, so an older server never erases it.
++        ("device", &serde_json::json!({ "deviceNo": snap["deviceNo"] })),
+     ];
+     for (kind, value) in kinds {
++        if kind == "device" && value["deviceNo"].is_null() {
++            continue;
++        }
+         tx.execute(
+             "INSERT INTO cache (kind, json) VALUES (?1, ?2) ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
+             params![kind, value.to_string()],
+@@ -182,3 +188,19 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
+ 
+     tx.commit().map_err(|e| e.to_string())
+ }
++
++/// This device's order id for a sale with local counter `seq`: `D<device number>-<seq, 4 digits>`
++/// (for example D2-0045). The counter is the outbox row number, which only ever grows on this
++/// device, so ids from different devices (and different offline sessions) can never collide.
++/// Falls back to the old provisional `L<seq>` until the device has been numbered by a sync.
++pub fn display_id(conn: &Connection, seq: i64) -> String {
++    let device_no: Option<i64> = conn
++        .query_row("SELECT json FROM cache WHERE kind = 'device'", [], |r| r.get::<_, String>(0))
++        .ok()
++        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
++        .and_then(|v| v["deviceNo"].as_i64());
++    match device_no {
++        Some(n) if n > 0 => format!("D{n}-{seq:04}"),
++        _ => format!("L{seq}"),
++    }
++}
+diff --git a/src/offline_api.rs b/src/offline_api.rs
+index 333e578..001b812 100644
+--- a/src/offline_api.rs
++++ b/src/offline_api.rs
+@@ -192,6 +192,7 @@ fn synth_pending_sales(conn: &Connection) -> Vec<Value> {
+         out.push(json!({
+             "id": format!("local:{client_id}"),
+             "order_no": format!("L{seq}"),
++            "display_id": crate::local_db::display_id(conn, seq),
+             "order_type": p["orderType"],
+             "subtotal": items_sum,
+             "tax": (total - items_sum - delivery).max(0.0),
+diff --git a/src/sync.rs b/src/sync.rs
+index c910334..fff9fe5 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -144,17 +144,17 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
+     // sale stays queued and the reason is shown in the sync bar so it is never silent.
+     let mut note: Option<String> = None;
+     loop {
+-        let rows: Vec<(String, String)> = {
++        let rows: Vec<(String, String, i64)> = {
+             let conn = db.0.lock().map_err(|e| (e.to_string(), false))?;
+             let mut stmt = conn
+                 .prepare(
+-                    "SELECT client_sale_id, payload FROM sales_outbox
++                    "SELECT client_sale_id, payload, seq FROM sales_outbox
+                      WHERE status = 'pending' AND (?1 IS NULL OR client_sale_id = ?1)
+                      ORDER BY seq LIMIT ?2",
+                 )
+                 .map_err(|e| (e.to_string(), false))?;
+             let mapped = stmt
+-                .query_map(params![only, UPLOAD_BATCH], |r| Ok((r.get(0)?, r.get(1)?)))
++                .query_map(params![only, UPLOAD_BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                 .map_err(|e| (e.to_string(), false))?;
+             mapped.collect::<Result<Vec<_>, _>>().map_err(|e| (e.to_string(), false))?
+         };
+@@ -162,7 +162,15 @@ fn upload_pending(db: &Db, client: &reqwest::blocking::Client, token: &str, only
+             return Ok(note);
+         }
+ 
+-        let sales: Vec<Value> = rows.iter().filter_map(|(_, p)| serde_json::from_str(p).ok()).collect();
++        // Each sale carries this device's own counter; the server builds the D<n>-<counter> id from it.
++        let sales: Vec<Value> = rows
++            .iter()
++            .filter_map(|(_, p, seq)| {
++                let mut v: Value = serde_json::from_str(p).ok()?;
++                v["deviceSeq"] = json!(seq);
++                Some(v)
++            })
++            .collect();
+         let resp = client
+             .post(format!("{API_BASE}/api/device/sales"))
+             .bearer_auth(token)
+@@ -426,9 +434,8 @@ pub fn search_local_customers(q: String, db: State<Db>) -> Result<Value, String>
+ 
+ // ---------------------------------------------------------------- offline sale
+ 
+-/// Saves a sale locally (always succeeds while unlocked), then makes one quick attempt to push
+-/// it. Online: returns the real order number straight away. Offline: returns a provisional
+-/// number ("L<n>") and the sale waits in the outbox until the next sync.
++/// Saves a sale locally (always succeeds while unlocked). The sale is saved to the local outbox and the cashier gets this device's own order id
++/// (D<device>-<counter>, e.g. D2-0045) immediately; the upload happens in the background.
+ #[tauri::command]
+ pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value, String> {
+     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+@@ -485,24 +492,24 @@ pub async fn create_local_sale(app: AppHandle, payload: Value) -> Result<Value,
+             }
+         }
+ 
+-        // One quick attempt; failure just means it syncs later.
+-        if let (Ok(token), Ok(client)) = (device_token(), http_client(6)) {
+-            let _ = upload_pending(&db, &client, &token, Some(&client_sale_id));
+-        }
++        // Offline first: the sale is already safely stored in the outbox above, so the cashier is
++        // released right now. The upload runs in the background (and the regular sync keeps retrying
++        // it); a failure just means it waits in the queue.
++        let order_id = {
++            let conn = db.0.lock().map_err(|e| e.to_string())?;
++            crate::local_db::display_id(&conn, seq)
++        };
+ 
+-        let conn = db.0.lock().map_err(|e| e.to_string())?;
+-        let (status, order_no, error): (String, Option<String>, Option<String>) = conn
+-            .query_row(
+-                "SELECT status, order_no, error FROM sales_outbox WHERE client_sale_id = ?",
+-                [&client_sale_id],
+-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+-            )
+-            .map_err(|e| e.to_string())?;
+-        match status.as_str() {
+-            "synced" => Ok(json!({ "orderNo": order_no, "offline": false })),
+-            "rejected" => Err(error.unwrap_or_else(|| "The server rejected this sale".to_string())),
+-            _ => Ok(json!({ "orderNo": format!("L{seq}"), "offline": true })),
+-        }
++        let bg_app = app.clone();
++        let bg_id = client_sale_id.clone();
++        std::thread::spawn(move || {
++            let db = bg_app.state::<Db>();
++            if let (Ok(token), Ok(client)) = (device_token(), http_client(20)) {
++                let _ = upload_pending(&db, &client, &token, Some(&bg_id));
++            }
++        });
++
++        Ok(json!({ "orderNo": order_id, "offline": false }))
+     })
+     .await
+     .map_err(|e| e.to_string())?

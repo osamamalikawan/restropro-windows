@@ -130,7 +130,7 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-    let kinds: [(&str, &serde_json::Value); 8] = [
+    let kinds: [(&str, &serde_json::Value); 9] = [
         ("products", &snap["products"]),
         ("tables", &snap["tables"]),
         ("areas", &snap["areas"]),
@@ -144,8 +144,14 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
             "settings",
             &serde_json::json!({ "restaurant": snap["restaurant"], "settings": snap["settings"] }),
         ),
+        // This device's number on the server (1, 2, 3 ...). Used for order ids like D2-0045.
+        // Only overwritten when the server sends one, so an older server never erases it.
+        ("device", &serde_json::json!({ "deviceNo": snap["deviceNo"] })),
     ];
     for (kind, value) in kinds {
+        if kind == "device" && value["deviceNo"].is_null() {
+            continue;
+        }
         tx.execute(
             "INSERT INTO cache (kind, json) VALUES (?1, ?2) ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
             params![kind, value.to_string()],
@@ -181,4 +187,20 @@ pub fn apply_snapshot(db: &Db, snap: &serde_json::Value) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     tx.commit().map_err(|e| e.to_string())
+}
+
+/// This device's order id for a sale with local counter `seq`: `D<device number>-<seq, 4 digits>`
+/// (for example D2-0045). The counter is the outbox row number, which only ever grows on this
+/// device, so ids from different devices (and different offline sessions) can never collide.
+/// Falls back to the old provisional `L<seq>` until the device has been numbered by a sync.
+pub fn display_id(conn: &Connection, seq: i64) -> String {
+    let device_no: Option<i64> = conn
+        .query_row("SELECT json FROM cache WHERE kind = 'device'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+        .and_then(|v| v["deviceNo"].as_i64());
+    match device_no {
+        Some(n) if n > 0 => format!("D{n}-{seq:04}"),
+        _ => format!("L{seq}"),
+    }
 }

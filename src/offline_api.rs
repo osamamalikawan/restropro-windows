@@ -192,6 +192,7 @@ fn synth_pending_sales(conn: &Connection) -> Vec<Value> {
         out.push(json!({
             "id": format!("local:{client_id}"),
             "order_no": format!("L{seq}"),
+            "display_id": crate::local_db::display_id(conn, seq),
             "order_type": p["orderType"],
             "subtotal": items_sum,
             "tax": (total - items_sum - delivery).max(0.0),
