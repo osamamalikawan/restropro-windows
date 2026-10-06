@@ -8,3 +8,5 @@ target/
 
 .env
 .env.local
+
+.archify/

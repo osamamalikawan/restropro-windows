@@ -1,6 +1,6 @@
 [package]
-name = "restropro-pos"
-version = "0.2.0"
+name = "restropro"
+version = "1.0.0"
 description = "Restro Pro POS — desktop shell with direct network thermal printer support"
 edition = "2021"
 
@@ -25,5 +25,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [[bin]]
-name = "restropro-pos"
+name = "restropro"
 path = "src/main.rs"

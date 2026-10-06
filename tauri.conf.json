@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Restro Pro POS",
-  "version": "0.2.0",
+  "productName": "Restro Pro",
+  "version": "1.0.0",
   "identifier": "com.restropro.pos",
   "build": {
     "frontendDist": "https://restropro-eta.vercel.app"
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Restro Pro POS",
+        "title": "Restro Pro",
         "url": "app://localhost/index.html",
         "width": 1280,
         "height": 820,
@@ -31,7 +31,9 @@
     "icon": ["icons/logo.png"],
     "windows": {
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     }
   }
