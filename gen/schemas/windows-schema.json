@@ -189,6 +189,12 @@
           "markdownDescription": "Enables the api_request command without any pre-configured scope."
         },
         {
+          "description": "Enables the check_for_shell_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-for-shell-update",
+          "markdownDescription": "Enables the check_for_shell_update command without any pre-configured scope."
+        },
+        {
           "description": "Enables the check_online command without any pre-configured scope.",
           "type": "string",
           "const": "allow-check-online",
@@ -231,10 +237,22 @@
           "markdownDescription": "Enables the get_local_session command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_shell_update_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-shell-update-status",
+          "markdownDescription": "Enables the get_shell_update_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_sync_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-sync-status",
           "markdownDescription": "Enables the get_sync_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_shell_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-shell-update",
+          "markdownDescription": "Enables the install_shell_update command without any pre-configured scope."
         },
         {
           "description": "Enables the list_serial_ports command without any pre-configured scope.",
@@ -339,6 +357,12 @@
           "markdownDescription": "Denies the api_request command without any pre-configured scope."
         },
         {
+          "description": "Denies the check_for_shell_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-for-shell-update",
+          "markdownDescription": "Denies the check_for_shell_update command without any pre-configured scope."
+        },
+        {
           "description": "Denies the check_online command without any pre-configured scope.",
           "type": "string",
           "const": "deny-check-online",
@@ -381,10 +405,22 @@
           "markdownDescription": "Denies the get_local_session command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_shell_update_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-shell-update-status",
+          "markdownDescription": "Denies the get_shell_update_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_sync_status command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-sync-status",
           "markdownDescription": "Denies the get_sync_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_shell_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-shell-update",
+          "markdownDescription": "Denies the install_shell_update command without any pre-configured scope."
         },
         {
           "description": "Denies the list_serial_ports command without any pre-configured scope.",

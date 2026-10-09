@@ -29,12 +29,21 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/logo.png"],
+    "createUpdaterArtifacts": true,
     "windows": {
       "nsis": {
         "installMode": "perMachine",
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4MzMyRTkxRUYwMUU0MzkKUldRNTVBSHZrUzR6eUU4ZkVGMlRhV0ZES0l4YWdLOHVlWkp5cmxsTlJ4K0N3eEpEcmJLblE1NGMK",
+      "endpoints": [
+        "https://github.com/osamamalikawan/restropro-desk/releases/latest/download/shell-latest.json"
+      ]
     }
   }
 }

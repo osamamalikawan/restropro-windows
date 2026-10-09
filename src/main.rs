@@ -31,6 +31,8 @@ mod sync;
 mod api_bridge;
 mod serial_print;
 
+mod shell_updater;
+
 use tauri::Manager;
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -278,34 +280,59 @@ fn main() {
     let db = local_db::init();
 
     tauri::Builder::default()
+        // Shell application updater plugins
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(db)
         .manage(staff_auth::SessionState::default())
+        .manage(shell_updater::ShellUpdateState::default())
         .register_uri_scheme_protocol("app", |_app, request| {
-            let raw_path = request.uri().path().trim_start_matches('/').to_string();
-            let raw_path = if raw_path.is_empty() { "index.html".to_string() } else { raw_path };
+            let raw_path = request
+                .uri()
+                .path()
+                .trim_start_matches('/')
+                .to_string();
+
+            let raw_path = if raw_path.is_empty() {
+                "index.html".to_string()
+            } else {
+                raw_path
+            };
 
             let base = bundle_updater::current_bundle_path();
+
             let Some(base) = base else {
                 return tauri::http::Response::builder()
                     .status(503)
-                    .body("No app bundle downloaded yet — connect to the internet once to finish setup.".as_bytes().to_vec())
+                    .body(
+                        b"No app bundle downloaded yet \xe2\x80\x94 connect to the internet once to finish setup."
+                            .to_vec(),
+                    )
                     .unwrap();
             };
 
             match resolve_static_file(&base, &raw_path) {
                 Some(file_path) => {
                     let data = std::fs::read(&file_path).unwrap_or_default();
-                    let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+                    let mime =
+                        mime_guess::from_path(&file_path).first_or_octet_stream();
+
                     tauri::http::Response::builder()
                         .header("Content-Type", mime.as_ref())
                         .body(data)
                         .unwrap()
                 }
                 None => {
-                    eprintln!("404: no match for {raw_path:?} under {base:?}");
+                    eprintln!(
+                        "404: no match for {raw_path:?} under {base:?}"
+                    );
+
                     let not_found = base.join("404.html");
+
                     if not_found.is_file() {
-                        let data = std::fs::read(&not_found).unwrap_or_default();
+                        let data =
+                            std::fs::read(&not_found).unwrap_or_default();
+
                         tauri::http::Response::builder()
                             .status(404)
                             .header("Content-Type", "text/html")
@@ -321,33 +348,102 @@ fn main() {
             }
         })
         .setup(|app| {
-            // Background sync: uploads queued offline sales and refreshes the local snapshot
-            // whenever the internet is reachable. Failing while offline is normal — ignore it.
+            // Background sync: uploads queued offline sales and refreshes
+            // the local snapshot whenever internet is reachable.
             let sync_handle = app.handle().clone();
+
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(20));
+
                 loop {
                     let _ = sync::run_sync(&sync_handle, false, false);
+
                     std::thread::sleep(Duration::from_secs(300));
                 }
             });
 
+            // Existing web bundle updater.
+            // This updates the web application assets, not the Tauri shell.
             let handle = app.handle().clone();
+
             std::thread::spawn(move || {
                 let result = bundle_updater::check_and_update();
+
                 match &result {
                     Ok(Some(v)) => println!("Updated bundle to {v}"),
                     Ok(None) => println!("Bundle already current"),
-                    Err(e) => eprintln!("Update check failed (using cached bundle if any): {e}"),
+                    Err(e) => {
+                        eprintln!(
+                            "Update check failed (using cached bundle if any): {e}"
+                        )
+                    }
                 }
 
                 if let Some(window) = handle.get_webview_window("main") {
                     if bundle_updater::current_bundle_path().is_some() {
                         let _ = window.eval("window.location.reload()");
                     }
+
                     let _ = window.show();
                 }
             });
+
+            // Shell updater: checks for a new desktop application release
+            // every 30 minutes. This is separate from the web bundle updater.
+            let shell_handle = app.handle().clone();
+
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to initialize shell updater runtime: {e}"
+                        );
+                        return;
+                    }
+                };
+
+                rt.block_on(async move {
+                    loop {
+                        if let Ok(updater) = shell_handle.updater() {
+                            match updater.check().await {
+                                Ok(Some(update)) => {
+                                    let version = update.version.clone();
+
+                                    let state = shell_handle
+                                        .state::<shell_updater::ShellUpdateState>();
+
+                                    *state.0.lock().unwrap() =
+                                        Some(version.clone());
+
+                                    println!(
+                                        "Shell update available: {version}"
+                                    );
+                                }
+                                Ok(None) => {
+                                    println!(
+                                        "Shell application is up to date"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Shell update check failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+
+                        tokio::time::sleep(
+                            std::time::Duration::from_secs(30 * 60),
+                        )
+                        .await;
+                    }
+                });
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -375,7 +471,12 @@ fn main() {
             sync::search_local_customers,
             sync::create_local_sale,
             api_bridge::api_request,
-            api_bridge::check_online
+            api_bridge::check_online,
+
+            // Shell updater commands
+            shell_updater::check_for_shell_update,
+            shell_updater::get_shell_update_status,
+            shell_updater::install_shell_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running Restro Pro POS");

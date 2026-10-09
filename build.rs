@@ -27,6 +27,9 @@ fn main() {
                 "create_local_sale",
                 "api_request",
                 "check_online",
+                "check_for_shell_update",
+                "get_shell_update_status",
+                "install_shell_update",
             ])),
     )
     .unwrap();

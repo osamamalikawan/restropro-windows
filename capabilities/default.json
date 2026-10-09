@@ -33,6 +33,11 @@
     "allow-search-local-customers",
     "allow-create-local-sale",
     "allow-api-request",
-    "allow-check-online"
+    "allow-check-online",
+    "updater:default",
+    "process:allow-restart",
+    "allow-check-for-shell-update",
+    "allow-get-shell-update-status",
+    "allow-install-shell-update"
   ]
 }

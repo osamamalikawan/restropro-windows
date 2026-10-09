@@ -3093,6 +3093,7 @@ dependencies = [
  "sha2",
  "tauri",
  "tauri-build",
+ "tokio",
  "windows 0.58.0",
  "zip",
 ]

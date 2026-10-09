@@ -6,6 +6,7 @@ edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -27,3 +28,6 @@ chrono = { version = "0.4", features = ["serde"] }
 [[bin]]
 name = "restropro"
 path = "src/main.rs"
+
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
