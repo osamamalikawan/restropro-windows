@@ -196,3 +196,12 @@ pub fn activate_device(email: String, password: String, db: State<Db>, app: taur
         slug: data.slug,
     })
 }
+
+#[tauri::command]
+pub fn deactivate_device(db: State<Db>) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM device_info", []).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM staff_cache", []).map_err(|e| e.to_string())?;
+    drop(conn);
+    crate::secure_store::secure_delete("device_token".to_string())
+}

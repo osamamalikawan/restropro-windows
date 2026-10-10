@@ -22,6 +22,7 @@ use windows::Win32::Graphics::Printing::{
     ClosePrinter, EndDocPrinter, EndPagePrinter, EnumPrintersW, OpenPrinterW, StartDocPrinterW,
     StartPagePrinter, WritePrinter, DOC_INFO_1W, PRINTER_ENUM_LOCAL, PRINTER_INFO_4W,
 };
+use tauri_plugin_updater::UpdaterExt;
 mod secure_store;
 mod bundle_updater;
 mod local_db;
